@@ -21,6 +21,7 @@ class TASKSTATE(Enum):
     NewSessionTicket = 5
     COMMUNICATION = 6
     PASS = 7
+    BLOCK = 8
 
 class KeyGenerator:
     def __init__(self):
@@ -301,11 +302,10 @@ class PktHandler:
         digest = digest.finalize()
 
         verify_data = prf(self.MASTER_KEY, b"client finished", digest, hashfn, verifydata_length)
-
         plain_text = self.CIPHER_DECRYPTORS[self.CIPHER_SUITE.name](finished_record, sport, sport)
 
         logging.debug("verify data for client handshakes: " + verify_data.hex())
-        logging.debug("client finished data is: " + plain_text.hex())
+        # logging.debug("client finished data is: " + plain_text.hex())
         if self.isdhe:
             # Encrypt verify data using client derive key.
             self.DERIVE_KEYS = self.CLIENT_DERIVE_KEYS
@@ -364,6 +364,7 @@ class PktHandler:
             param_len = dhe_part[0]
             pubk_in_pkt = X25519PublicKey.from_public_bytes(dhe_part[1:1+param_len])
             self.client_shared_key = self.dhe_privkey.exchange(pubk_in_pkt)
+
             pubkey = self.dhe_privkey.public_key().public_bytes(
                 encoding = serialization.Encoding.Raw,
                 format = serialization.PublicFormat.Raw
@@ -396,7 +397,11 @@ class PktHandler:
         tcp = dpkt.tcp.TCP(data) 
 
         if tcp.seq in self.visited:
-            return (TASKSTATE.PASS.value, self.isdhe)
+            if self.isdhe:
+                return (TASKSTATE.BLOCK.value, self.isdhe)
+            else:
+                return (TASKSTATE.PASS.value, self.isdhe)
+
         else:
             self.visited.add(tcp.seq)
 
@@ -467,6 +472,7 @@ class PktHandler:
 
             elif handshake_type == "ClientKeyExchange":
                 session_records = bytearray(b"".join(list(map(lambda x: bytes(x), msgs))))
+                print("client key exchange session record: " + session_records.hex())
 
                 # MODIFIED DHE has changed.
                 self.handle_clientkeyexchange(session_records, first_pkt, tcp, tls)
@@ -474,13 +480,19 @@ class PktHandler:
                 # TODO: In parallel.
                 self.handle_changeCipherSpec(tcp.sport)
 
-                self.handle_clientfinished(bytes(msgs[-1]), tcp.sport)
+                # self.handle_clientfinished(bytes(msgs[-1]), tcp.sport)
                 return (TASKSTATE.ClientKeyExchange.value, self.isdhe)
 
             elif handshake_type == "NewSessionTicket":
-                self.handle_sessionticket(first_pkt.data)
-                self.handle_serverfinished()
+                # self.handle_sessionticket(first_pkt.data)
+                # self.handle_serverfinished()
                 return (TASKSTATE.NewSessionTicket.value, self.isdhe)
+
+            else:
+                return (1, False)
+        else:
+            logging.error("Unexpected messege type" + tls.__class__.__name__)
+            return (TASKSTATE.PASS.value, False)
 
     def handle_changeCipherSpec(self, sport):
         # No need to generate key twice.
