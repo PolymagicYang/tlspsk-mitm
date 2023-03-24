@@ -143,6 +143,7 @@ class PktHandler:
 
     def decrypt_chacha_poly_dhe(self, ct_record, cur_port, sip):
         if cur_port == self.CLIENT_PORT:
+            logging.debug("using client derive keys")
             self.DERIVE_KEYS = self.CLIENT_DERIVE_KEYS
         else:
             self.DERIVE_KEYS = self.SERVER_DERIVE_KEYS
@@ -302,6 +303,7 @@ class PktHandler:
         digest = digest.finalize()
 
         verify_data = prf(self.MASTER_KEY, b"client finished", digest, hashfn, verifydata_length)
+
         plain_text = self.CIPHER_DECRYPTORS[self.CIPHER_SUITE.name](finished_record, sport, sport)
 
         logging.debug("verify data for client handshakes: " + verify_data.hex())
@@ -480,7 +482,7 @@ class PktHandler:
                 # TODO: In parallel.
                 self.handle_changeCipherSpec(tcp.sport)
 
-                # self.handle_clientfinished(bytes(msgs[-1]), tcp.sport)
+                self.handle_clientfinished(bytes(msgs[-1]), tcp.sport)
                 return (TASKSTATE.ClientKeyExchange.value, self.isdhe)
 
             elif handshake_type == "NewSessionTicket":
@@ -507,7 +509,7 @@ class PktHandler:
             self.PRE_MASTER = self.CLIENT_PRE_MASTER
             self.handshake_bytes = self.client_handshake_bytes
             result_client = self.changeCipherSpec()
-            self.CLIENT_DERIVE_KEYS = self.DERIVE_KEYS
+            self.CLIENT_DERIVE_KEYS = self.DERIVE_KEYS.copy()
 
             self.PRE_MASTER = self.SERVER_PRE_MASTER
             self.handshake_bytes = self.server_handshake_bytes
