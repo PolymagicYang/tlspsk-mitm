@@ -84,6 +84,16 @@ class PktHandler:
             "TLS_PSK_WITH_AES_256_CBC_SHA": self.decrypt_aes_cbc,
             "TLS_PSK_WITH_NULL_SHA256": self.decrypt_null,
         }
+        self.CIPHER_ENCRYPTORS = {
+            "TLS_ECDHE_PSK_WITH_CHACHA20_POLY1305_SHA256": self.encrypt_chacha_poly_dhe,
+            "TLS_PSK_WITH_CHACHA20_POLY1305_SHA256": self.encrypt_chacha_poly,
+            "TLS_PSK_WITH_AES_256_GCM_SHA384": self.encrypt_aes_gcm,
+            "TLS_PSK_WITH_AES_128_GCM_SHA256": self.encrypt_aes_gcm,
+            "TLS_PSK_WITH_AES_128_CBC_SHA256": self.encrypt_aes_cbc,
+            "TLS_PSK_WITH_AES_256_CBC_SHA": self.encrypt_aes_cbc,
+            "TLS_PSK_WITH_NULL_SHA256": self.encrypt_null,
+        }
+
         self.key_lock = Lock()
 
         root = logging.getLogger()
@@ -94,27 +104,30 @@ class PktHandler:
         handler.setFormatter(formatter)
         root.addHandler(handler)
 
-    def decrypt_aes_cbc(self, ct_record, sport, sip):
+    def decrypt_aes_cbc(self, ct_record, key, iv):
         # trunc mac
-        cipher_text = ct[:len(ct) - self.CIPHER_SUITE.mac_size]
+        record_no_mac = ct_record[:-self.CIPHER_SUITE.mac_size]
         packet_type = ct_record[0:1] 
         proto_version = ct_record[1:3]
         ct_len = int(ct_record[3:5].hex(), 16)
-        ct = ct_record[5:5+ct_len]
+        ct = record_no_mac[5:5+ct_len]
 
-        algo, mode = self.cipher_meta(sport)
-        cipher = Cipher(algo, mode)
+        cipher = Cipher(algorithms.AES(key), modes.CBC(iv))
         decryptor = cipher.decryptor()
-        return decryptor.update(cipher_text) + decryptor.finalize()
-        
-    def decrypt_aes_gcm(self, ct_record, cur_port, sip):
-        if cur_port == self.CLIENT_PORT:
-            key = self.DERIVE_KEYS["client_write_key"]
-            iv = self.DERIVE_KEYS["client_iv"]
-        else:
-            key = self.DERIVE_KEYS["server_write_key"]
-            iv = self.DERIVE_KEYS["server_iv"]
+        return decryptor.update(ct) + decryptor.finalize()
 
+    def encrypt_aes_cbc(self, plaintext, key, iv):
+        cipher = Cipher(algorithms.AES(key), modes.CBC(iv))
+        encryptor = cipher.encryptor()
+        return encryptor.update(plaintext) + encryptor.finalize()
+
+    def encrypt_aes_gcm(self):
+        return b""
+
+    def encrypt_null(self):
+        return b""
+        
+    def decrypt_aes_gcm(self, ct_record, key, iv):
         # RFC 5246: 6.2.3.3.
         # additional data: 8 (seq_num) + 1 (packet_type) + 2 (proto_version) + 2 (length).
         seq_num = self.SEQUENCE_NUM.to_bytes(8, "big") # seq_num is 64 bit long.
@@ -141,54 +154,41 @@ class PktHandler:
         logging.debug("aad:" + aad.hex() + "len:" + str(len(aad)))
         return aesgcm.decrypt(nonce, ct, aad)
 
-    def decrypt_chacha_poly_dhe(self, ct_record, cur_port, sip):
-        if cur_port == self.CLIENT_PORT:
-            logging.debug("using client derive keys")
-            self.DERIVE_KEYS = self.CLIENT_DERIVE_KEYS
+    def decrypt_chacha_poly_dhe(self, ct_record, from_client):
+        if from_client:
+            key = self.CLIENT_DERIVE_KEYS["client_write_key"]
+            iv = self.CLIENT_DERIVE_KEYS["client_iv"]
         else:
-            self.DERIVE_KEYS = self.SERVER_DERIVE_KEYS
+            key = self.SERVER_DERIVE_KEYS["server_write_key"]
+            iv = self.SERVER_DERIVE_KEYS["server_iv"]
 
-        return self.decrypt_chacha_poly(ct_record, cur_port, sip)
+        return self.decrypt_chacha_poly(ct_record, key, iv)
 
-    def encrypt_chacha_poly(self, ct_record, plain_data, cur_port, sip):
-        if cur_port == self.CLIENT_PORT:
-            key = self.DERIVE_KEYS["client_write_key"]
-            iv = self.DERIVE_KEYS["client_iv"]
+    def encrypt_chacha_poly_dhe(self, header: bytes, plaintext: bytes, to_client: bool) -> bytes:
+        if to_client:
+            key = self.CLIENT_DERIVE_KEYS["server_write_key"]
+            iv = self.CLIENT_DERIVE_KEYS["server_iv"]
         else:
-            key = self.DERIVE_KEYS["server_write_key"]
-            iv = self.DERIVE_KEYS["server_iv"]
+            key = self.SERVER_DERIVE_KEYS["client_write_key"]
+            iv = self.SERVER_DERIVE_KEYS["client_iv"]
 
-        print(self.DERIVE_KEYS)
+        return self.encrypt_chacha_poly(header, plaintext, key, iv)
 
+    def encrypt_chacha_poly(self, header: bytes, plaintext: bytes, key: bytes, iv: bytes) -> bytes:
         seq_num = self.SEQUENCE_NUM.to_bytes(8, "big")
-        packet_type = ct_record[0:1] 
-        proto_version = ct_record[1:3]
-
-        plain_data = b"".join([b"\x14\x00\x00\x0c", plain_data])
-        length = len(plain_data).to_bytes(2, "big")
-
-        aad = b"".join([seq_num, packet_type, proto_version, length])
         padded_seq = self.SEQUENCE_NUM.to_bytes(12, "big")
+        aad = b"".join([seq_num, header])
         nonce = bytes([_a ^ _b for _a, _b in zip(iv, padded_seq)])
 
         chacha = ChaCha20Poly1305(key)
         logging.debug("key: " + key.hex())
         logging.debug("ct, tag, nonce:")
-        logging.debug("plain text:" + plain_data.hex() + "len:" + str(len(plain_data)))
+        logging.debug("plain text:" + plaintext.hex() + "len:" + str(len(plaintext)))
         logging.debug("nonce:" + nonce.hex() + "len:" + str(len(nonce)))
         logging.debug("aad:" + aad.hex() + "len:" + str(len(aad)))
-        return chacha.encrypt(nonce, plain_data, aad)
+        return chacha.encrypt(nonce, plaintext, aad)
 
-    def decrypt_chacha_poly(self, ct_record, cur_port, sip):
-        if cur_port == self.CLIENT_PORT:
-            key = self.DERIVE_KEYS["client_write_key"]
-            iv = self.DERIVE_KEYS["client_iv"]
-        else:
-            key = self.DERIVE_KEYS["server_write_key"]
-            iv = self.DERIVE_KEYS["server_iv"]
-
-        print(self.DERIVE_KEYS)
-
+    def decrypt_chacha_poly(self, ct_record, key, iv):
         # RFC 5246: 6.2.3.3.
         # additional data: 8 (seq_num) + 1 (packet_type) + 2 (proto_version) + 2 (length).
         seq_num = self.SEQUENCE_NUM.to_bytes(8, "big") # seq_num is 64 bit long.
@@ -311,7 +311,7 @@ class PktHandler:
 
         if self.isdhe:
             self.MASTER_KEY = self.CLIENT_MASTER_KEY
-        plain_text = self.CIPHER_DECRYPTORS[self.CIPHER_SUITE.name](finished_record, self.CLIENT_PORT, self.CLIENT_PORT)
+        plain_text = self.CIPHER_DECRYPTORS[self.CIPHER_SUITE.name](finished_record, True)
 
         # verify data length for CTR_OMAC cipher suites is 32, CNT_IMIT is 12, so 1 byte is enough to represent all the conditions.
         verifydata_length = plain_text[3]
@@ -320,7 +320,6 @@ class PktHandler:
             verify_data = prf(self.SERVER_MASTER_KEY, b"client finished", digest, hashfn, verifydata_length)
         else:
             verify_data = prf(self.MASTER_KEY, b"client finished", digest, hashfn, verifydata_length)
-
 
         logging.debug("verify data for client handshakes: " + verify_data.hex())
         logging.debug("client finished data is: " + plain_text.hex())
@@ -331,9 +330,12 @@ class PktHandler:
             # Verify data sent to server is generated by us, so extend messages with modified messeges.
             self.server_handshake_bytes.extend(verify_data)
 
-            verify_data = self.encrypt_chacha_poly(finished_record, verify_data, self.CLIENT_PORT, self.CLIENT_PORT)
+            verify_data = b"".join([b"\x14\x00\x00\x0c", verify_data])
+            header = b"".join([b"\x16\x03\x03", len(verify_data).to_bytes(2, "big")])
+            logging.debug("ClientFinished: verify data " + verify_data.hex())
+            verify_data = self.CIPHER_ENCRYPTORS[self.CIPHER_SUITE.name](header, verify_data, False)
 
-            logging.debug("ClientFinished: session  data " + self.MODIFIED_TLS_DHE.hex())
+            logging.debug("ClientFinished: session data " + self.MODIFIED_TLS_DHE.hex())
             temp = bytearray(self.MODIFIED_TLS_DHE)
             temp[-len(verify_data):] = verify_data
             self.MODIFIED_TLS_DHE = bytes(temp)
@@ -352,28 +354,43 @@ class PktHandler:
             print("session data: " + session_data.hex())
             self.handshake_bytes.extend(session_data)
 
-    def handle_serverfinished(self):
-        # verify data length for CTR_OMAC cipher suites is 32, CNT_IMIT is 12
-        verifydata_length = 32 if self.isdhe else 12
-
+    def handle_serverfinished(self, finished_record):
         if self.CIPHER_SUITE.mac == "SHA256":
             hashfn = hashes.SHA256()
         elif self.CIPHER_SUITE.mac == "SHA384":
             hashfn = hashes.SHA384()
         digest = hashes.Hash(hashfn)
         if self.isdhe:
-            digest.update(bytes(self.server_handshake_bytes))
+            digest.update(bytes(self.client_handshake_bytes))
+            logging.debug("ServerFinished clientHandshake bytes: " + self.client_handshake_bytes.hex())
+            logging.debug("ServerFinished serverHandshake bytes: " + self.server_handshake_bytes.hex())
         else:
             digest.update(bytes(self.handshake_bytes))
         digest = digest.finalize()
-        
-        verify_data = prf(self.MASTER_KEY, b"server finished", digest, hashfn, verifydata_length)
+
+        self.DERIVE_KEYS = self.SERVER_DERIVE_KEYS
+        plain_text = self.CIPHER_DECRYPTORS[self.CIPHER_SUITE.name](finished_record, False)
+
+        # verify data length for CTR_OMAC cipher suites is 32, CNT_IMIT is 12, so 1 byte is enough to represent all the conditions.
+        verifydata_length = plain_text[3]
+
+        # Generate master key for server usage.
+        if self.isdhe:
+            verify_data = prf(self.CLIENT_MASTER_KEY, b"server finished", digest, hashfn, verifydata_length)
+        else:
+            verify_data = prf(self.MASTER_KEY, b"server finished", digest, hashfn, verifydata_length)
 
         logging.debug("verify data for server handshakes: " + verify_data.hex())
 
         if self.isdhe:
             temp = bytearray(self.MODIFIED_TLS_DHE)
-            temp[-verifydata_length:] = verify_data
+            self.DERIVE_KEYS = self.CLIENT_DERIVE_KEYS
+
+            verify_data = b"".join([b"\x14\x00\x00\x0c", verify_data])
+            header = b"".join([b"\x16\x03\x03", len(verify_data).to_bytes(2, "big")])
+            verify_data = self.CIPHER_ENCRYPTORS[self.CIHPER_SUITE.name](header, verify_data, self.SERVER_PORT, True)
+
+            temp[-len(verify_data):] = verify_data
             self.MODIFIED_TLS_DHE = bytes(temp)
 
     def handle_clientkeyexchange(self, session_records, record, tcp, tls):
@@ -389,7 +406,7 @@ class PktHandler:
             self.client_shared_key = self.dhe_privkey.exchange(pubk_in_pkt)
 
             pubkey = self.dhe_privkey.public_key().public_bytes(
-                encoding = serialization.Encoding.Raw,
+                encoding = serialization.Encoding.Raw.name,
                 format = serialization.PublicFormat.Raw
             )
 
@@ -458,8 +475,22 @@ class PktHandler:
         if isinstance(tls, dpkt.ssl.TLSAppData):
             logging.info("start parse.")
             ct_record = bytes(first_pkt)
-            plain_text = self.CIPHER_DECRYPTORS[self.CIPHER_SUITE.name](ct_record, tcp.sport, tcp.sport)
+            if self.isdhe:
+                if tcp.sport == self.CLIENT_PORT:
+                    self.DERIVE_KEYS = self.CLIENT_DERIVE_KEYS
+                    plain_text = self.CIPHER_DECRYPTORS[self.CIPHER_SUITE.name](ct_record, tcp.sport)
+                else:
+                    self.DERIVE_KEYS = self.SERVER_DERIVE_KEYS
+                    plain_text = self.CIPHER_DECRYPTORS[self.CIPHER_SUITE.name](ct_record, tcp.sport)
+            else:
+                plain_text = self.CIPHER_DECRYPTORS[self.CIPHER_SUITE.name](ct_record, tcp.sport)
             logging.info("plain text:" + plain_text.hex())
+
+            plaintext = b"tampered"
+            header = b"".join([b"\x17\x03\x03", len(plaintext).to_bytes(2, "big")])
+            tampered_data = self.CIPHER_ENCRYPTORS[self.CIPHER_SUITE.name](header, plaintext, tcp.dport == self.CLIENT_PORT)
+
+            self.MODIFIED_TLS_DHE = b"".join([b"\x23\x03\x03", len(tampered_data).to_bytes(2, "big")]) 
             return (TASKSTATE.COMMUNICATION.value, self.isdhe)
 
         elif isinstance(tls, dpkt.ssl.TLSChangeCipherSpec):
@@ -514,7 +545,7 @@ class PktHandler:
                 session_data = bytearray(b"".join(list(map(lambda x: bytes(x), msgs))))
                 self.MODIFIED_TLS_DHE = session_data
                 self.handle_sessionticket(first_pkt.data)
-                self.handle_serverfinished()
+                self.handle_serverfinished(bytes(msgs[-1]))
                 return (TASKSTATE.NewSessionTicket.value, self.isdhe)
 
             else:
@@ -534,13 +565,13 @@ class PktHandler:
                 logging.error("Failed to parse pre_secret")
                 return False
             self.PRE_MASTER = self.SERVER_PRE_MASTER
-            self.handshake_bytes = self.server_handshake_bytes
+            self.handshake_bytes = self.server_handshake_bytes.copy()
             result_server = self.changeCipherSpec()
             self.SERVER_DERIVE_KEYS = self.DERIVE_KEYS.copy()
             self.SERVER_MASTER_KEY = self.MASTER_KEY
 
             self.PRE_MASTER = self.CLIENT_PRE_MASTER
-            self.handshake_bytes = self.client_handshake_bytes
+            self.handshake_bytes = self.client_handshake_bytes.copy()
             result_client = self.changeCipherSpec()
             self.CLIENT_DERIVE_KEYS = self.DERIVE_KEYS.copy()
             self.CLIENT_MASTER_KEY = self.MASTER_KEY
@@ -611,17 +642,4 @@ class PktHandler:
         self.is_key_generated = True
 
         return True
-
-    def cipher_meta(self, port):
-        # should add ip support packet identification.
-        algo_fn = eval("algorithms." + self.CIPHER_META["cipher"])
-        mode_fn = eval("modes." + self.CIPHER_META["mode"])
-        if port == self.CLIENT_PORT:
-            algo = algo_fn(self.DERIVE_KEYS["client_write_key"])
-            mode = mode_fn(self.DERIVE_KEYS["client_iv"])
-        else:
-            algo = algo_fn(self.DERIVE_KEYS["server_write_key"])
-            mode = mode_fn(self.DERIVE_KEYS["server_iv"])
-
-        return (algo, mode)
 
