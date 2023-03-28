@@ -388,7 +388,7 @@ class PktHandler:
 
             verify_data = b"".join([b"\x14\x00\x00\x0c", verify_data])
             header = b"".join([b"\x16\x03\x03", len(verify_data).to_bytes(2, "big")])
-            verify_data = self.CIPHER_ENCRYPTORS[self.CIHPER_SUITE.name](header, verify_data, self.SERVER_PORT, True)
+            verify_data = self.CIPHER_ENCRYPTORS[self.CIPHER_SUITE.name](header, verify_data, self.SERVER_PORT, True)
 
             temp[-len(verify_data):] = verify_data
             self.MODIFIED_TLS_DHE = bytes(temp)
@@ -406,8 +406,8 @@ class PktHandler:
             self.client_shared_key = self.dhe_privkey.exchange(pubk_in_pkt)
 
             pubkey = self.dhe_privkey.public_key().public_bytes(
-                encoding = serialization.Encoding.Raw.name,
-                format = serialization.PublicFormat.Raw
+                    encoding = serialization.Encoding.Raw, 
+                    format = serialization.PublicFormat.Raw
             )
 
             temp_tls_record = bytearray(bytes(record))
