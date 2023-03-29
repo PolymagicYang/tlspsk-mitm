@@ -197,6 +197,10 @@ class PktHandler:
         proto_version = ct_record[1:3]
         ct_len = int(ct_record[3:5].hex(), 16)
         ct = ct_record[5:5+ct_len]
+        
+        logging.debug("packet type: " + packet_type.hex())
+        logging.debug("proto version: " + proto_version.hex())
+        logging.debug("ct len: " + str(ct_len))
 
         length = (ct_len - 16).to_bytes(2, "big")
 
@@ -388,7 +392,7 @@ class PktHandler:
 
             verify_data = b"".join([b"\x14\x00\x00\x0c", verify_data])
             header = b"".join([b"\x16\x03\x03", len(verify_data).to_bytes(2, "big")])
-            verify_data = self.CIPHER_ENCRYPTORS[self.CIPHER_SUITE.name](header, verify_data, self.SERVER_PORT, True)
+            verify_data = self.CIPHER_ENCRYPTORS[self.CIPHER_SUITE.name](header, verify_data, True)
 
             temp[-len(verify_data):] = verify_data
             self.MODIFIED_TLS_DHE = bytes(temp)
@@ -442,6 +446,7 @@ class PktHandler:
 
         if tcp.seq in self.visited:
             if self.isdhe:
+                logging.debug("block ")
                 return (TASKSTATE.BLOCK.value, self.isdhe)
             else:
                 return (TASKSTATE.PASS.value, self.isdhe)
@@ -476,21 +481,19 @@ class PktHandler:
             logging.info("start parse.")
             ct_record = bytes(first_pkt)
             if self.isdhe:
-                if tcp.sport == self.CLIENT_PORT:
-                    self.DERIVE_KEYS = self.CLIENT_DERIVE_KEYS
-                    plain_text = self.CIPHER_DECRYPTORS[self.CIPHER_SUITE.name](ct_record, tcp.sport)
-                else:
-                    self.DERIVE_KEYS = self.SERVER_DERIVE_KEYS
-                    plain_text = self.CIPHER_DECRYPTORS[self.CIPHER_SUITE.name](ct_record, tcp.sport)
+                plain_text = self.CIPHER_DECRYPTORS[self.CIPHER_SUITE.name](ct_record, tcp.sport == self.CLIENT_PORT)
             else:
                 plain_text = self.CIPHER_DECRYPTORS[self.CIPHER_SUITE.name](ct_record, tcp.sport)
             logging.info("plain text:" + plain_text.hex())
 
-            plaintext = b"tampered"
+            plaintext = b"ping"
             header = b"".join([b"\x17\x03\x03", len(plaintext).to_bytes(2, "big")])
-            tampered_data = self.CIPHER_ENCRYPTORS[self.CIPHER_SUITE.name](header, plaintext, tcp.dport == self.CLIENT_PORT)
 
-            self.MODIFIED_TLS_DHE = b"".join([b"\x23\x03\x03", len(tampered_data).to_bytes(2, "big")]) 
+            # do not use dport.
+            tampered_data = self.CIPHER_ENCRYPTORS[self.CIPHER_SUITE.name](header, plaintext, tcp.sport == self.SERVER_PORT)
+
+            self.MODIFIED_TLS_DHE = b"".join([b"\x17\x03\x03", len(tampered_data).to_bytes(2, "big"), tampered_data]) 
+
             return (TASKSTATE.COMMUNICATION.value, self.isdhe)
 
         elif isinstance(tls, dpkt.ssl.TLSChangeCipherSpec):
