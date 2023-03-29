@@ -75,6 +75,9 @@ class PktHandler:
         self.PROTO_VERSION = None
         self.STATE = "HANDSHAKE"
         self.isdhe = False
+        self.seq_records = list()
+        self.MODIFIED_TLS_DHE = b""
+        self.MODIFIED_TCP = b""
         self.CIPHER_DECRYPTORS = {
             "TLS_ECDHE_PSK_WITH_CHACHA20_POLY1305_SHA256": self.decrypt_chacha_poly_dhe,
             "TLS_PSK_WITH_CHACHA20_POLY1305_SHA256": self.decrypt_chacha_poly,
@@ -450,9 +453,10 @@ class PktHandler:
                 return (TASKSTATE.BLOCK.value, self.isdhe)
             else:
                 return (TASKSTATE.PASS.value, self.isdhe)
-
         else:
             self.visited.add(tcp.seq)
+            self.seq_records.append(tcp.seq)
+            logging.debug("recorded seq num: " + str(self.seq_records))
 
         try:
             msgs, i = dpkt.ssl.tls_multi_factory(tcp.data)
@@ -479,6 +483,8 @@ class PktHandler:
         """
         if isinstance(tls, dpkt.ssl.TLSAppData):
             logging.info("start parse.")
+            
+            self.MODIFIED_TLS_DHE = b""
             ct_record = bytes(first_pkt)
             if self.isdhe:
                 plain_text = self.CIPHER_DECRYPTORS[self.CIPHER_SUITE.name](ct_record, tcp.sport == self.CLIENT_PORT)
@@ -492,7 +498,18 @@ class PktHandler:
             # do not use dport.
             tampered_data = self.CIPHER_ENCRYPTORS[self.CIPHER_SUITE.name](header, plaintext, tcp.sport == self.SERVER_PORT)
 
-            self.MODIFIED_TLS_DHE = b"".join([b"\x17\x03\x03", len(tampered_data).to_bytes(2, "big"), tampered_data]) 
+            self.MODIFIED_TLS_DHE = self.MODIFIED_TLS_DHE.join([b"\x17\x03\x03", len(tampered_data).to_bytes(2, "big"), tampered_data]) 
+
+            # transmit ACK back directly, and block the return ack from the other side.
+            """
+            tcp.sport, tcp.dport = tcp.dport, tcp.sport
+            tcp.seq = tcp.ack
+            tcp.ack = tcp.seq + len(bytes(tcp.data))
+            tcp.flags = dpkt.tcp.TH_ACK
+            tcp.data = b""
+            self.visited.add(tcp.seq)
+            self.MODIFIED_TCP = bytes(tcp)
+            """
 
             return (TASKSTATE.COMMUNICATION.value, self.isdhe)
 
